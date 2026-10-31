@@ -1,0 +1,20 @@
+module sh.sysl.zip
+
+@tests
+
+// Round trips: what the writer makes, the reader reads back exactly.
+
+import sysl.buf.{Buf, buf}
+
+@test("one deflated entry comes back as it went in")
+one_entry_round_trips()
+    var w = writer()
+
+    w.add("hello.txt", "Hello, zip!\n".bytes).unwrap()
+
+    val file = w.finish()
+    val zip = open(file.view()).unwrap()
+
+    assert_eq(zip.entries.len(), 1)
+    assert_eq(zip.read(zip.entries[0]).unwrap().view(), "Hello, zip!\n".bytes)
+end one_entry_round_trips

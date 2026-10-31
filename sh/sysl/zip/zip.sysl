@@ -1,0 +1,500 @@
+// ZIP archives, written and read in memory: stored or deflated, as PKWARE's APPNOTE.TXT lays them out.
+//
+//     var w = writer()
+//
+//     w.add("[Content_Types].xml", types.bytes)?
+//     w.add("3D/3dmodel.model", model.bytes)?
+//
+//     val file = w.finish()
+//
+// and the other way round:
+//
+//     val zip = open(file.view())?
+//
+//     for e in zip.entries.view()
+//         val data = zip.read(e)?
+//
+// **The container is written here; the compression is miniz's.** Deflate and inflate are run raw,
+// with storage this package hands them, and CRC-32 is miniz's too. Everything else -- local headers,
+// the central directory, the end record, the checks a reader owes the bytes it was given -- is in this
+// file.
+//
+// ## Same input, same bytes
+//
+// An archive carries a modification time for every entry, and a writer that stamped the clock into it
+// would make two builds of one thing differ. So the time is the writer's `time` field, which starts at
+// the earliest moment a DOS date can say -- 1980-01-01 00:00:00 -- and is whatever the caller sets it
+// to after that. Nothing else in the output depends on anything but the names, the bytes and the
+// method, so the same calls make the same archive.
+//
+// ## What a reader refuses
+//
+// A name is a path somebody will extract to, so a name that climbs out of the directory it is
+// extracted into is refused on the way in **and** on the way out: an absolute path, a drive letter, a
+// `..` component, a backslash (which is a separator to Windows and hides a `..` from everybody else),
+// and a NUL. Every offset and length in the archive is checked against the bytes before it is used,
+// and every entry read is checked against the CRC-32 and the sizes the central directory records.
+
+module sh.sysl.zip
+
+import sysl.buf.{Buf, buf, buf_filled}
+import sysl.encoding.{get_u16_le, get_u32_le, push_u16_le, push_u32_le}
+import sysl.text.from_utf8
+import sysl.slices.copy
+import sh.sysl.miniz.{DEFLATE_BYTES, INFLATE_BYTES, Level, Format, deflate, inflate, bound, crc32}
+
+// ## The numbers the format fixes
+
+private val LOCAL_SIG: u32 = 0x04034b50
+private val CENTRAL_SIG: u32 = 0x02014b50
+private val END_SIG: u32 = 0x06054b50
+private val ZIP64_LOCATOR_SIG: u32 = 0x07064b50
+
+private val LOCAL_LEN: usize = 30
+private val CENTRAL_LEN: usize = 46
+private val END_LEN: usize = 22
+
+// The end record's comment is at most this long, which bounds how far back a reader looks for it.
+private val MAX_COMMENT: usize = 65535
+
+// Bit 0: the entry is encrypted. Bit 3: its CRC and sizes follow the data rather than preceding it.
+// Bit 11: the name is UTF-8.
+private val FLAG_ENCRYPTED: u16 = 0x0001
+private val FLAG_UTF8: u16 = 0x0800
+
+// The largest number a 32-bit field can carry, and so the largest size or offset an archive without
+// ZIP64 can describe. The entry count's field is sixteen bits.
+private val MAX_U32: usize = 0xFFFFFFFF
+private val MAX_ENTRIES: usize = 65535
+
+// ## Entries
+
+// How an entry's bytes are stored.
+enum Method derives Eq
+    // As they are.
+    Stored
+
+    // Raw DEFLATE (method 8), which every reader of ZIP understands.
+    Deflate
+
+    // Any other method number. A reader lists such an entry and refuses to read it; a writer refuses it.
+    Other(code: u16)
+
+    code(self) -> u16 = self match
+        Stored -> 0
+        Deflate -> 8
+        Other(c) -> c
+
+    of(code: u16) -> Method = code match
+        0 -> Stored
+        8 -> Deflate
+        _ -> Other(code)
+end Method
+
+// A modification time as the format stores it: two sixteen-bit fields at a resolution of two seconds,
+// from 1980 to 2107, with no time zone.
+struct DosTime derives Eq
+    date: u16
+    time: u16
+
+    year(self) -> int = 1980 + int(self.date >> 9)
+    month(self) -> int = int(self.date >> 5 & 15)
+    day(self) -> int = int(self.date & 31)
+    hour(self) -> int = int(self.time >> 11)
+    minute(self) -> int = int(self.time >> 5 & 63)
+
+    // Always even: the field counts pairs of seconds.
+    second(self) -> int = int(self.time & 31) * 2
+end DosTime
+
+// 1980-01-01 00:00:00, the earliest time the format can say, and what a writer stamps by default.
+val EPOCH = DosTime(0x0021, 0)
+
+// A time from its parts, or `None` where the format cannot hold it: a year outside 1980..2107, or a
+// part out of its range. An odd second is rounded down.
+dos_time(year: int, month: int, day: int, hour: int = 0, minute: int = 0,
+         second: int = 0) -> Option[DosTime]
+    if year < 1980 || year > 2107 || month < 1 || month > 12 || day < 1 || day > 31 then return None
+    if hour < 0 || hour > 23 || minute < 0 || minute > 59 || second < 0 || second > 59 then return None
+
+    Some(DosTime(u16((year - 1980) << 9 | month << 5 | day), u16(hour << 11 | minute << 5 | second / 2)))
+end dos_time
+
+// One file in an archive, as its central directory describes it.
+struct Entry
+    name: string
+    method: Method
+
+    // CRC-32 of the uncompressed bytes.
+    crc: u32
+
+    // The uncompressed size, and the size as stored.
+    size: usize
+    packed: usize
+
+    time: DosTime
+    flags: u16
+
+    // Where the entry's local header starts.
+    offset: usize
+
+    // Whether the entry is a directory, which the format says by a name ending in `/`.
+    is_dir(self) -> bool = self.name.ends_with("/")
+end Entry
+
+// ## Errors
+
+// Why an archive could not be written or read.
+enum ZipError derives Eq
+    // There is no end-of-central-directory record, so these bytes are not a ZIP archive -- or are one
+    // that has lost its end.
+    NotZip
+
+    // A structure that should start at `at` does not carry its signature there.
+    BadSignature(at: usize)
+
+    // An offset or a length points outside the archive, or a structure runs past the end of the region
+    // it has to sit in.
+    OutOfRange(at: usize)
+
+    // A name that is empty, too long, not UTF-8, absolute, or climbs out with `..` (see `check_name`).
+    BadName(name: string)
+
+    // The local header's name is not the central directory's for the same entry.
+    Mismatch(name: string)
+
+    // A compression method other than stored or deflate.
+    Unsupported(method: u16)
+
+    // The entry is encrypted, which this package does not read.
+    Encrypted(name: string)
+
+    // The archive uses ZIP64 or spans several disks, neither of which this package reads.
+    Zip64
+    MultiDisk
+
+    // Writing: an entry or the archive would pass 4 GiB, which only ZIP64 can describe.
+    TooLarge
+
+    // Writing: a 65,536th entry, which only ZIP64 can count.
+    TooMany
+
+    // Reading: the entry's bytes do not have the CRC-32, or the size, the central directory records.
+    BadCrc(name: string)
+    BadSize(name: string)
+
+    // Reading: the entry's deflate stream is not a valid one.
+    Corrupt(name: string)
+end ZipError
+
+impl Display for ZipError
+    display(self, out: *sysl.Writer, fmt: FormatSpec)
+        val text = self match
+            NotZip -> "not a ZIP archive: no end-of-central-directory record"
+            BadSignature(at) -> s"no ZIP signature where one should be, at byte $at"
+            OutOfRange(at) -> s"a ZIP structure points outside the archive, at byte $at"
+            BadName(name) -> s"refused entry name '$name': empty, too long, not UTF-8, absolute, or climbing out with '..'"
+            Mismatch(name) -> s"entry '$name': the local header names a different file"
+            Unsupported(m) -> s"compression method $m is not supported (only stored and deflate are)"
+            Encrypted(name) -> s"entry '$name' is encrypted, which is not supported"
+            Zip64 -> "ZIP64 archives are not supported"
+            MultiDisk -> "archives spanning several disks are not supported"
+            TooLarge -> "a ZIP archive without ZIP64 cannot pass 4 GiB"
+            TooMany -> "a ZIP archive without ZIP64 cannot hold more than 65535 entries"
+            BadCrc(name) -> s"entry '$name': CRC-32 does not match the data"
+            BadSize(name) -> s"entry '$name': the data is not the size the archive records"
+            Corrupt(name) -> s"entry '$name': the deflate stream is corrupt"
+
+        display_pad(text.bytes, out, fmt)
+    end display
+
+// ## Names
+
+// Whether `name` may be written to an archive or extracted from one. Refused: the empty name, one
+// longer than 65,535 bytes, one starting with `/` or `\` or a drive letter, one holding a `\` or a NUL
+// anywhere, and one with a `..` component.
+check_name(name: string) -> Result[unit, ZipError]
+    val b = name.bytes
+
+    if b.len == 0 || b.len > 65535 || b[0] == u8('/') then return Err(BadName(name))
+    if b.len >= 2 && b[1] == u8(':') then return Err(BadName(name))
+
+    var start: usize = 0
+
+    for i in 0..b.len
+        if i == b.len || b[i] == u8('/')
+            if i - start == 2 && b[start] == u8('.') && b[start + 1] == u8('.') then return Err(BadName(name))
+
+            start = i + 1
+        else if b[i] == u8('\\') || b[i] == 0
+            return Err(BadName(name))
+
+    Ok(())
+end check_name
+
+// ## Writing
+
+// An archive being built in memory.
+struct Writer
+    // The local headers and data written so far, and the central directory that will follow them.
+    out: Buf[u8]
+    central: Buf[u8]
+    count: usize
+
+    // The modification time stamped on each entry as it is added. Set it between `add`s to give
+    // entries different times.
+    time: DosTime
+
+    // How hard deflate tries.
+    level: Level
+
+    // The compressor's storage, made by the first deflated entry and kept for the rest.
+    work: []u8
+
+    // The largest the archive may grow: 4 GiB less one. A field so that a test can reach the refusal
+    // without four gigabytes.
+    limit: usize
+
+    // Add a file. A name ending in `/` with no bytes is a directory.
+    //
+    // **`Deflate` is a request, not a promise**: where deflating does not make the bytes smaller --
+    // an empty file, a few bytes, data already compressed -- they are stored, as `zip` does.
+    add(*self, name: string, data: []const u8, method: Method = Method.Deflate) -> Result[unit, ZipError]
+        check_name(name)?
+
+        if method != Stored && method != Deflate then return Err(Unsupported(method.code()))
+        if self.count == MAX_ENTRIES then return Err(TooMany)
+        if data.len > self.limit then return Err(TooLarge)
+
+        var packed: []const u8 = data
+        var code = Method.Stored
+
+        if method == Deflate && data.len > 0
+            if self.work.len == 0 then self.work = [0; DEFLATE_BYTES]
+
+            val dst: []u8 = [0; bound(data.len)]
+            val n = deflate(self.work, data, dst, self.level, Format.Raw)
+                .expect("a destination of bound(len) bytes holds any stream")
+
+            if n < data.len
+                packed = dst[0..<n]
+                code = Deflate
+
+        val nlen = name.bytes.len
+        val grown = self.out.len() + LOCAL_LEN + nlen + packed.len + self.central.len() + CENTRAL_LEN + nlen +
+                    END_LEN
+
+        if grown > self.limit then return Err(TooLarge)
+
+        val offset = u32(self.out.len())
+        val crc = crc32(data)
+        val version: u16 = if code == Deflate || name.ends_with("/") then 20 else 10
+
+        // The local header: what an extractor reading front to back meets first.
+        push_u32_le(self.out, LOCAL_SIG)
+        push_u16_le(self.out, version)
+        self.header_tail(self.out, FLAG_UTF8, code, crc, u32(packed.len), u32(data.len), nlen)
+        push_u16_le(self.out, 0)
+        self.out.extend(name.bytes)
+        self.out.extend(packed)
+
+        // The central directory's record of the same entry, which is what a reader trusts.
+        push_u32_le(self.central, CENTRAL_SIG)
+        push_u16_le(self.central, 20)
+        push_u16_le(self.central, version)
+        self.header_tail(self.central, FLAG_UTF8, code, crc, u32(packed.len), u32(data.len), nlen)
+        push_u16_le(self.central, 0)
+        push_u16_le(self.central, 0)
+        push_u16_le(self.central, 0)
+        push_u16_le(self.central, 0)
+        push_u32_le(self.central, if name.ends_with("/") then 0x10 else 0)
+        push_u32_le(self.central, offset)
+        self.central.extend(name.bytes)
+
+        self.count += 1
+
+        Ok(())
+    end add
+
+    // The fields local and central headers share, from the flags to the name's length.
+    private header_tail(self, b: Buf[u8], flags: u16, method: Method, crc: u32, packed: u32, size: u32,
+                        nlen: usize)
+        push_u16_le(b, flags)
+        push_u16_le(b, method.code())
+        push_u16_le(b, self.time.time)
+        push_u16_le(b, self.time.date)
+        push_u32_le(b, crc)
+        push_u32_le(b, packed)
+        push_u32_le(b, size)
+        push_u16_le(b, u16(nlen))
+    end header_tail
+
+    // The archive: everything added, the central directory, and the end record.
+    //
+    // **The writer is spent afterwards** -- the answer is its own buffer -- so add nothing more to it.
+    finish(*self) -> Buf[u8]
+        val at = u32(self.out.len())
+
+        self.out.extend(self.central.view())
+
+        push_u32_le(self.out, END_SIG)
+        push_u16_le(self.out, 0)
+        push_u16_le(self.out, 0)
+        push_u16_le(self.out, u16(self.count))
+        push_u16_le(self.out, u16(self.count))
+        push_u32_le(self.out, u32(self.central.len()))
+        push_u32_le(self.out, at)
+        push_u16_le(self.out, 0)
+
+        self.out
+    end finish
+end Writer
+
+// A writer with nothing in it, stamping `time` on what is added and deflating at `level`.
+writer(time: DosTime = EPOCH, level: Level = Level.Default) -> Writer =
+    Writer(buf(), buf(), 0, time, level, [], MAX_U32)
+
+// ## Reading
+
+// An archive read from bytes the caller owns. The entries are the central directory's, in its order.
+struct Archive
+    bytes: []const u8
+    entries: Buf[Entry]
+
+    // Where the central directory starts, which no entry's data may run past.
+    private[zip] directory: usize
+
+    // The first entry called `name`.
+    find(self, name: string) -> Option[Entry]
+        for e in self.entries.view()
+            if e.name == name then return Some(e)
+
+        None
+    end find
+
+    // The bytes of `e`, decompressed and checked against the CRC-32 and the sizes the central
+    // directory records.
+    read(self, e: Entry) -> Result[Buf[u8], ZipError]
+        if e.flags & FLAG_ENCRYPTED != 0 then return Err(Encrypted(e.name))
+        if e.method != Stored && e.method != Deflate then return Err(Unsupported(e.method.code()))
+
+        val b = self.bytes
+
+        if e.offset + LOCAL_LEN > self.directory then return Err(OutOfRange(e.offset))
+        if u32_at(b, e.offset) != LOCAL_SIG then return Err(BadSignature(e.offset))
+
+        val nlen = usize(u16_at(b, e.offset + 26))
+        val xlen = usize(u16_at(b, e.offset + 28))
+        val name_at = e.offset + LOCAL_LEN
+        val start = name_at + nlen + xlen
+
+        if start + e.packed > self.directory then return Err(OutOfRange(e.offset))
+        if b[name_at..<name_at + nlen] != e.name.bytes then return Err(Mismatch(e.name))
+
+        val packed = b[start..<start + e.packed]
+        var out = buf_filled(e.size, u8(0))
+
+        if e.method == Stored
+            if e.packed != e.size then return Err(BadSize(e.name))
+
+            copy(out.view(), packed)
+        else
+            var work: []u8 = [0; INFLATE_BYTES]
+
+            inflate(work, packed, out.view(), Format.Raw) match
+                Ok(n) -> if n != e.size then return Err(BadSize(e.name))
+                Err(Full) -> return Err(BadSize(e.name))
+                Err(Trailing) -> return Err(BadSize(e.name))
+                Err(_) -> return Err(Corrupt(e.name))
+
+        if crc32(out.view()) != e.crc then return Err(BadCrc(e.name))
+
+        Ok(out)
+    end read
+end Archive
+
+private u16_at(b: []const u8, at: usize) -> u16 = get_u16_le(b[at..]).expect("bounds checked before reading")
+private u32_at(b: []const u8, at: usize) -> u32 = get_u32_le(b[at..]).expect("bounds checked before reading")
+
+// Where the end-of-central-directory record starts: the last place its signature appears with a
+// comment that runs exactly to the end of the bytes.
+private find_end(b: []const u8) -> Option[usize]
+    if b.len < END_LEN then return None
+
+    val last = b.len - END_LEN
+    val first = if last > MAX_COMMENT then last - MAX_COMMENT else 0
+    var at = last
+
+    loop
+        if u32_at(b, at) == END_SIG && at + END_LEN + usize(u16_at(b, at + 20)) == b.len then return Some(at)
+        if at == first then return None
+
+        at -= 1
+end find_end
+
+// Whether a central header's extra field, `extra`, carries a ZIP64 record (header ID 1).
+private has_zip64(extra: []const u8) -> bool
+    var at: usize = 0
+
+    while at + 4 <= extra.len
+        if u16_at(extra, at) == 1 then return true
+
+        at += 4 + usize(u16_at(extra, at + 2))
+
+    false
+end has_zip64
+
+// Read the central directory of the archive in `bytes`. Nothing is decompressed until `read`.
+open(bytes: []const u8) -> Result[Archive, ZipError]
+    val end = find_end(bytes).ok_or(NotZip)?
+
+    if end >= 20 && u32_at(bytes, end - 20) == ZIP64_LOCATOR_SIG then return Err(Zip64)
+    if u16_at(bytes, end + 4) != 0 || u16_at(bytes, end + 6) != 0 then return Err(MultiDisk)
+
+    val here = usize(u16_at(bytes, end + 8))
+    val total = usize(u16_at(bytes, end + 10))
+    val size = usize(u32_at(bytes, end + 12))
+    val directory = usize(u32_at(bytes, end + 16))
+
+    if here != total then return Err(MultiDisk)
+    if directory + size > end then return Err(OutOfRange(end))
+
+    var entries: Buf[Entry] = buf()
+    var at = directory
+    val stop = directory + size
+
+    for _ in 0..<total
+        if at + CENTRAL_LEN > stop then return Err(OutOfRange(at))
+        if u32_at(bytes, at) != CENTRAL_SIG then return Err(BadSignature(at))
+
+        val nlen = usize(u16_at(bytes, at + 28))
+        val xlen = usize(u16_at(bytes, at + 30))
+        val clen = usize(u16_at(bytes, at + 32))
+        val next = at + CENTRAL_LEN + nlen + xlen + clen
+
+        if next > stop then return Err(OutOfRange(at))
+        if u16_at(bytes, at + 34) != 0 then return Err(MultiDisk)
+
+        val name_at = at + CENTRAL_LEN
+        val extra = bytes[name_at + nlen..<name_at + nlen + xlen]
+
+        if has_zip64(extra) then return Err(Zip64)
+
+        val name = from_utf8(bytes[name_at..<name_at + nlen]).map_err(_ -> BadName("(not UTF-8)"))?
+
+        check_name(name)?
+
+        val e = Entry(name, Method.of(u16_at(bytes, at + 10)), u32_at(bytes, at + 16),
+                      usize(u32_at(bytes, at + 24)), usize(u32_at(bytes, at + 20)),
+                      DosTime(u16_at(bytes, at + 14), u16_at(bytes, at + 12)), u16_at(bytes, at + 8),
+                      usize(u32_at(bytes, at + 42)))
+
+        if e.offset + LOCAL_LEN > directory then return Err(OutOfRange(at))
+
+        entries.push(e)
+        at = next
+
+    if at != stop then return Err(OutOfRange(at))
+
+    Ok(Archive(bytes, entries, directory))
+end open

@@ -1,0 +1,38 @@
+// ZIP archives for sysl: written and read in memory, stored or deflated.
+//
+// A `Writer` gathers entries into a `Buf[u8]` laid out as PKWARE's APPNOTE.TXT says -- local headers,
+// the central directory, the end record -- with the same bytes out for the same calls in. `open` reads
+// the central directory of an archive the caller already has as bytes, and `read` hands back an
+// entry's contents checked against its CRC-32 and sizes. Names that would extract outside the target
+// directory are refused both ways.
+//
+// This is the block a consumer writes to reach it:
+//
+//     dependencies {
+//       zip { git = "github.com/sysl-lang/zip", version = "0.1.0" }
+//     }
+//
+// The coordinate names the package, `zip`; the module a program imports is `sh.sysl.zip`.
+
+package {
+  name    = "zip"
+  version = "0.1.0"
+
+  // **The oldest compiler this builds with**, raised to the one it was last built and tested with.
+  sysl = "0.8.9"
+}
+
+// **`heap = true`**: an archive is gathered in a `Buf`, an entry is read into one, and the deflate
+// and inflate storage miniz runs in is made per writer and per read.
+//
+// **What is NOT here is `os` or `posix`.** This package opens nothing: a caller hands over bytes and
+// gets bytes back, and where they come from or go to is the program's business. The tests read
+// fixtures from disk and run `unzip` and `zipinfo`, but a consumer never builds them.
+requires {
+  heap = true
+}
+
+// Raw DEFLATE, inflate and CRC-32, with caller-owned state.
+dependencies {
+  miniz { git = "github.com/sysl-lang/miniz", version = "0.3.2" }
+}
