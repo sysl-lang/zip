@@ -1,0 +1,193 @@
+module sh.sysl.zip
+
+@tests
+
+// Two oracles that are not this code.
+//
+// - **Archives written here are read by the system's Info-ZIP `unzip` and `zipinfo`**: `unzip -t`
+//   checks every CRC, `unzip -p` extracts the bytes for comparing, and `zipinfo` reports the method,
+//   the size and the name of every entry the way it read them.
+// - **Archives written by `zip` and by Python's `zipfile`**, checked into `tests/fixtures/`, are read
+//   here to the exact contents that went in. Those include Info-ZIP's extra fields, data descriptors
+//   (flag bit 3, from a writer that could not seek back), an archive comment, a UTF-8 name, and two
+//   names a reader must refuse.
+//
+// The suite needs `unzip` and `zipinfo` on the path.
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_temp_dir, write_bytes, remove_dir_all, read_bytes}
+import sysl.process.capture
+import sysl.text.Search
+
+// The fixtures' directory, found from this file's place in the tree.
+private[zip] fixture(name: string) -> []u8
+    val here = __FILE__
+    val cut = here.last_index_of("/sh/sysl/zip/").expect("this file sits under sh/sysl/zip")
+
+    read_bytes(s"${here[0..<cut]}/tests/fixtures/$name").unwrap()
+end fixture
+
+// How many times `needle` occurs in `text`.
+private occurrences(text: string, needle: string) -> usize
+    var n: usize = 0
+    var at: usize = 0
+
+    loop
+        text[at..].index_of(needle) match
+            Some(i) ->
+                n += 1
+                at += i + needle.len
+            None -> return n
+end occurrences
+
+// An archive with one of everything the writer does.
+private[zip] varied() -> Buf[u8]
+    var w = writer(dos_time(2026, 10, 31, 12, 34, 56).unwrap())
+
+    w.add("[Content_Types].xml", "<Types/>\n".bytes).unwrap()
+    w.add("3D/3dmodel.model", repeated().view()).unwrap()
+    w.add("stored.txt", "kept as it is\n".bytes, Stored).unwrap()
+    w.add("empty.txt", []).unwrap()
+    w.add("folder/", []).unwrap()
+    w.add("folder/noise.bin", noise(3000, 11)).unwrap()
+    w.add("café.txt", "naïve\n".bytes).unwrap()
+
+    w.finish()
+end varied
+
+@test("unzip -t finds no errors in what the writer makes")
+unzip_tests_clean()
+    val dir = make_temp_dir("zip-unzip").unwrap()
+
+    write_bytes(s"$dir/varied.zip", varied().view()).unwrap()
+    write_bytes(s"$dir/hand.zip", hand_made()).unwrap()
+
+    var empty = writer()
+
+    write_bytes(s"$dir/empty.zip", empty.finish().view()).unwrap()
+
+    val out = capture("unzip", ["-t", s"$dir/varied.zip"]).unwrap()
+
+    assert(out.status.ok(), out.text)
+    assert(out.text.contains("No errors detected in compressed data"), out.text)
+    assert_eq(occurrences(out.text, "OK"), 7)
+
+    val hand = capture("unzip", ["-t", s"$dir/hand.zip"]).unwrap()
+
+    assert(hand.status.ok(), hand.text)
+    assert(hand.text.contains("testing: a.txt"), hand.text)
+
+    // An archive of nothing is a valid one, which unzip says with a warning and exit status 1.
+    val none = capture("unzip", ["-t", s"$dir/empty.zip"], stderr = true).unwrap()
+
+    assert(none.text.contains("empty") || none.err.unwrap_or("").contains("empty"), none.text)
+
+    remove_dir_all(dir).unwrap()
+end unzip_tests_clean
+
+@test("unzip -p extracts exactly the bytes that went in")
+unzip_extracts_the_bytes()
+    val dir = make_temp_dir("zip-unzip-p").unwrap()
+
+    write_bytes(s"$dir/varied.zip", varied().view()).unwrap()
+
+    assert_eq(capture("unzip", ["-p", s"$dir/varied.zip", "3D/3dmodel.model"]).unwrap().text.bytes, repeated().view())
+    assert_eq(capture("unzip", ["-p", s"$dir/varied.zip", "stored.txt"]).unwrap().text, "kept as it is\n")
+    assert_eq(capture("unzip", ["-p", s"$dir/varied.zip", "café.txt"]).unwrap().text, "naïve\n")
+    assert_eq(capture("unzip", ["-p", s"$dir/varied.zip", "\\[Content_Types\\].xml"]).unwrap().text, "<Types/>\n")
+
+    remove_dir_all(dir).unwrap()
+end unzip_extracts_the_bytes
+
+@test("zipinfo reads every entry's method, size, time and name as they were written")
+zipinfo_agrees()
+    val dir = make_temp_dir("zip-zipinfo").unwrap()
+
+    write_bytes(s"$dir/varied.zip", varied().view()).unwrap()
+
+    val out = capture("zipinfo", [s"$dir/varied.zip"]).unwrap()
+    val t = out.text
+
+    assert(out.status.ok(), t)
+    assert(t.contains("number of entries: 7"), t)
+    assert(t.contains("-rw-r--r--  2.0 unx        9 b- stor 26-Oct-31 12:34 [Content_Types].xml"), t)
+    assert(t.contains("-rw-r--r--  2.0 unx     8800 b- defN 26-Oct-31 12:34 3D/3dmodel.model"), t)
+    assert(t.contains("-rw-r--r--  2.0 unx       14 b- stor 26-Oct-31 12:34 stored.txt"), t)
+    assert(t.contains("-rw-r--r--  2.0 unx        0 b- stor 26-Oct-31 12:34 empty.txt"), t)
+    assert(t.contains("drwxr-xr-x  2.0 unx        0 b- stor 26-Oct-31 12:34 folder/"), t)
+    assert(t.contains("-rw-r--r--  2.0 unx     3000 b- stor 26-Oct-31 12:34 folder/noise.bin"), t)
+    assert(t.contains("-rw-r--r--  2.0 unx        7 b- stor 26-Oct-31 12:34 café.txt"), t)
+
+    // The verbose listing: the end record where it should be, and no data descriptors.
+    val v = capture("zipinfo", ["-v", s"$dir/varied.zip"]).unwrap().text
+
+    assert(v.contains("central directory contains 7 entries"), v)
+    assert_eq(occurrences(v, "extended local header:                          no"), 7)
+    assert_eq(occurrences(v, "file last modified on (DOS date/time):          2026 Oct 31 12:34:56"), 7)
+
+    remove_dir_all(dir).unwrap()
+end zipinfo_agrees
+
+// -- Archives other writers made ------------------------------------------------------------------
+
+private read_named(zip: Archive, name: string) -> Buf[u8] = zip.read(zip.find(name).unwrap()).unwrap()
+
+@test("an archive Info-ZIP's zip made is read to its exact contents")
+reads_infozip()
+    val bytes = fixture("infozip.zip")
+    val zip = open(bytes).unwrap()
+
+    assert_eq(zip.entries.len(), 5)
+    assert_eq(zip.entries[0].name, "hello.txt")
+    assert_eq(zip.entries[1].method, Deflate)
+    assert_eq(zip.entries[3].name, "dir/")
+    assert(zip.entries[3].is_dir(), "dir/ is a directory")
+    assert_eq(read_named(zip, "hello.txt").view(), "Hello, zip!\n".bytes)
+    assert_eq(read_named(zip, "repeated.txt").view(), repeated().view())
+    assert_eq(read_named(zip, "empty.txt").len(), 0)
+    assert_eq(read_named(zip, "dir/").len(), 0)
+    assert_eq(read_named(zip, "dir/nested.txt").view(), "nested\n".bytes)
+
+    // zipinfo lists them at 2026-10-31 00:46.
+    val t = zip.entries[0].time
+
+    assert_eq([t.year(), t.month(), t.day(), t.hour(), t.minute()], [2026, 10, 31, 0, 46])
+end reads_infozip
+
+@test("an archive zip -0 stored is read to its exact contents")
+reads_infozip_stored()
+    val zip = open(fixture("stored.zip")).unwrap()
+
+    assert_eq(zip.entries.len(), 2)
+    assert_eq(zip.entries[1].method, Stored)
+    assert_eq(zip.entries[1].packed, 8800)
+    assert_eq(read_named(zip, "hello.txt").view(), "Hello, zip!\n".bytes)
+    assert_eq(read_named(zip, "repeated.txt").view(), repeated().view())
+end reads_infozip_stored
+
+@test("entries written with data descriptors are read from the central directory's sizes")
+reads_data_descriptors()
+    val zip = open(fixture("streamed.zip")).unwrap()
+
+    assert_eq(zip.entries.len(), 2)
+    assert_eq(zip.entries[0].flags & 0x0008, 0x0008)
+    assert_eq(zip.entries[0].crc, 0xf57b75de)
+    assert_eq(read_named(zip, "streamed.txt").view(), repeated().view())
+    assert_eq(read_named(zip, "small.txt").view(), "Hello, zip!\n".bytes)
+end reads_data_descriptors
+
+@test("a UTF-8 name and an archive comment are read past correctly")
+reads_utf8_and_comment()
+    val zip = open(fixture("utf8.zip")).unwrap()
+
+    assert_eq(zip.entries.len(), 2)
+    assert_eq(zip.entries[0].name, "café/日本.txt")
+    assert_eq(read_named(zip, "café/日本.txt").view(), "naïve\n".bytes)
+    assert_eq(read_named(zip, "plain.txt").len(), 0)
+end reads_utf8_and_comment
+
+@test("archives naming ../evil.txt and /etc/evil are refused when opened")
+refuses_slip_fixtures()
+    assert_eq(open(fixture("slip.zip")).map(a -> a.entries.len()), Err(BadName("../evil.txt")))
+    assert_eq(open(fixture("absolute.zip")).map(a -> a.entries.len()), Err(BadName("/etc/evil")))
+end refuses_slip_fixtures

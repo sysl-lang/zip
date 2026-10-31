@@ -62,6 +62,15 @@ private val MAX_COMMENT: usize = 65535
 private val FLAG_ENCRYPTED: u16 = 0x0001
 private val FLAG_UTF8: u16 = 0x0800
 
+// "Made by" Unix (3, the high byte), to version 2.0 of the format (20). **The host matters to
+// readers**: Info-ZIP's `unzip` reads a name from an MS-DOS host as code page 437 whatever flag bit
+// 11 says, so `café.txt` from a "fat" archive extracts as `caf+�.txt`. A Unix host is read as UTF-8,
+// and lets the external attributes carry permissions: a regular file 0644, a directory 0755 (with
+// the MS-DOS directory bit as well).
+private val MADE_BY: u16 = 0x0314
+private val FILE_ATTRS: u32 = 0o100644 << 16
+private val DIR_ATTRS: u32 = 0o040755 << 16 | 0x10
+
 // The largest number a 32-bit field can carry, and so the largest size or offset an archive without
 // ZIP64 can describe. The entry count's field is sixteen bits.
 private val MAX_U32: usize = 0xFFFFFFFF
@@ -217,7 +226,10 @@ check_name(name: string) -> Result[unit, ZipError]
     val b = name.bytes
 
     if b.len == 0 || b.len > 65535 || b[0] == u8('/') then return Err(BadName(name))
-    if b.len >= 2 && b[1] == u8(':') then return Err(BadName(name))
+    val lower = b[0] | 0x20
+    val letter = lower >= u8('a') && lower <= u8('z')
+
+    if b.len >= 2 && b[1] == u8(':') && letter then return Err(BadName(name))
 
     var start: usize = 0
 
@@ -300,14 +312,14 @@ struct Writer
 
         // The central directory's record of the same entry, which is what a reader trusts.
         push_u32_le(self.central, CENTRAL_SIG)
-        push_u16_le(self.central, 20)
+        push_u16_le(self.central, MADE_BY)
         push_u16_le(self.central, version)
         self.header_tail(self.central, FLAG_UTF8, code, crc, u32(packed.len), u32(data.len), nlen)
         push_u16_le(self.central, 0)
         push_u16_le(self.central, 0)
         push_u16_le(self.central, 0)
         push_u16_le(self.central, 0)
-        push_u32_le(self.central, if name.ends_with("/") then 0x10 else 0)
+        push_u32_le(self.central, if name.ends_with("/") then DIR_ATTRS else FILE_ATTRS)
         push_u32_le(self.central, offset)
         self.central.extend(name.bytes)
 
@@ -332,7 +344,7 @@ struct Writer
     // The archive: everything added, the central directory, and the end record.
     //
     // **The writer is spent afterwards** -- the answer is its own buffer -- so add nothing more to it.
-    finish(*self) -> Buf[u8]
+    finish(self) -> Buf[u8]
         val at = u32(self.out.len())
 
         self.out.extend(self.central.view())
