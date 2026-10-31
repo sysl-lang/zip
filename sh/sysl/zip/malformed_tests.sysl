@@ -125,11 +125,23 @@ bad_size()
 
     assert_eq(first_error(patched32(file.view(), size_at, 8799)), Some(BadSize("text")))
     assert_eq(first_error(patched32(file.view(), size_at, 8801)), Some(BadSize("text")))
+end bad_size
 
-    // A size deflate could never reach from this little data is refused before it is allocated.
+// **A size deflate could never reach from this little data is refused before it is allocated.**
+// Without that check the answer is the same `BadSize` -- after four gigabytes have been zeroed and
+// inflated into -- so what tells the two apart is the time limit.
+@test("a recorded size of 4 GiB over a few bytes is refused without allocating it", timeout: 2)
+size_bomb()
+    var w = writer()
+
+    w.add("text", repeated().view()).unwrap()
+
+    val file = w.finish()
+    val size_at = file.len() - 22 - 46 - 4 + 24
+
     assert_eq(first_error(patched32(file.view(), size_at, 0xfffffff0)), Some(BadSize("text")))
     assert_eq(first_error(patched32(hand_made(), 61, 0xfffffff0)), Some(BadSize("a.txt")))
-end bad_size
+end size_bomb
 
 @test("a missing signature is BadSignature at the place it should have been")
 bad_signature()
@@ -148,6 +160,16 @@ out_of_range()
     // The directory shorter than its one entry, and longer than it with nothing after.
     assert_eq(first_error(patched32(patched32(hand_made(), 100, 50), 104, 37)), Some(OutOfRange(37)))
     assert_eq(first_error(patched32(patched32(hand_made(), 100, 51), 104, 36)), Some(BadSignature(36)))
+
+    // A directory claiming a byte more than its entries fill: one junk byte inserted before the end
+    // record, and the size grown to cover it.
+    var slack: Buf[u8] = buf()
+
+    slack.extend(hand_made()[0..<88])
+    slack.push(0)
+    slack.extend(hand_made()[88..])
+
+    assert_eq(first_error(patched32(slack.view(), 101, 52)), Some(OutOfRange(88)))
 
     // An entry whose local header is past the start of the directory.
     assert_eq(first_error(patched32(hand_made(), 79, 20)), Some(OutOfRange(37)))
@@ -232,7 +254,9 @@ zip64_refused()
     assert_eq(first_error(patched(with_extra, 88, 0x55)), None)
 end zip64_refused
 
-@test("a fixed-seed fuzz of mangled archives never crashes")
+// Mangled sizes are among what this meets, so a limit here catches an allocation bomb too: without
+// the check before allocating, the run took a minute rather than a tenth of a second.
+@test("a fixed-seed fuzz of mangled archives never crashes", timeout: 20)
 fuzz_mangled()
     val v = varied()
     val seeds = [v.view(), fixture("infozip.zip"), fixture("utf8.zip")]

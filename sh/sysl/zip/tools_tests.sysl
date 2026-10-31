@@ -123,6 +123,10 @@ zipinfo_agrees()
 
     assert(v.contains("central directory contains 7 entries"), v)
     assert_eq(occurrences(v, "extended local header:                          no"), 7)
+
+    // Version 2.0 is needed for deflate and for a directory, 1.0 for the five stored files.
+    assert_eq(occurrences(v, "minimum software version required to extract:   2.0"), 2)
+    assert_eq(occurrences(v, "minimum software version required to extract:   1.0"), 5)
     assert_eq(occurrences(v, "file last modified on (DOS date/time):          2026 Oct 31 12:34:56"), 7)
 
     remove_dir_all(dir).unwrap()
