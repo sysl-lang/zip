@@ -1,0 +1,265 @@
+module sh.sysl.zip
+
+@tests
+
+// Archives that are wrong in every way a reader has to notice. **Never a crash, always an error**: the
+// bytes come from somewhere else, so each offset and length in them is checked before it is used.
+//
+// Most cases patch `hand_made()`, whose every byte is known: the local header at 0 (name at 30, data
+// "hi" at 35), the central header at 37 (its CRC at 53, sizes at 57 and 61, local offset at 79, name
+// at 83), the end record at 88 (directory size at 100, offset at 104).
+
+import sysl.buf.{Buf, buf}
+import sysl.encoding.{put_u16_le, put_u32_le}
+
+// `bytes` with the byte at `at` replaced.
+private patched(bytes: []const u8, at: usize, value: u8) -> []u8
+    val out: []u8 = [0; bytes.len]
+
+    for i in 0..<bytes.len
+        out[i] = bytes[i]
+
+    out[at] = value
+    out
+end patched
+
+private patched16(bytes: []const u8, at: usize, value: u16) -> []u8
+    val out = patched(bytes, at, bytes[at])
+
+    put_u16_le(out[at..], value)
+    out
+end patched16
+
+private patched32(bytes: []const u8, at: usize, value: u32) -> []u8
+    val out = patched(bytes, at, bytes[at])
+
+    put_u32_le(out[at..], value)
+    out
+end patched32
+
+// What opening `bytes` and reading its first entry answers, as one error or `None`.
+private first_error(bytes: []const u8) -> Option[ZipError]
+    val zip = open(bytes) match
+        Ok(z) -> z
+        Err(e) -> return Some(e)
+
+    zip.read(zip.entries[0]) match
+        Ok(_) -> None
+        Err(e) -> Some(e)
+end first_error
+
+// Open `bytes` and read every entry, answering whether everything succeeded. Errors are expected; a
+// crash is the failure.
+private survives(bytes: []const u8) -> bool
+    val zip = open(bytes) match
+        Ok(z) -> z
+        Err(_) -> return false
+
+    var all = true
+
+    for e in zip.entries.view()
+        if zip.read(e).is_err() then all = false
+
+    all
+end survives
+
+@test("bytes that are not an archive at all")
+not_an_archive()
+    assert_eq(open([]).map(z -> z.entries.len()), Err(NotZip))
+    assert_eq(open("PK".bytes).map(z -> z.entries.len()), Err(NotZip))
+    assert_eq(open(noise(4096, 5)).map(z -> z.entries.len()), Err(NotZip))
+
+    // An end record followed by bytes its comment length does not cover is not an end record.
+    var trailing: Buf[u8] = buf()
+
+    trailing.extend(hand_made())
+    trailing.push(0)
+
+    assert_eq(open(trailing.view()).map(z -> z.entries.len()), Err(NotZip))
+end not_an_archive
+
+@test("every truncation of an archive is an error, and none crashes")
+truncated_everywhere()
+    val v = varied()
+
+    for bytes in [v.view(), hand_made(), fixture("infozip.zip"), fixture("streamed.zip")]
+        for n in 0..<bytes.len
+            assert(open(bytes[0..<n]).is_err(), s"a prefix of $n bytes")
+
+        assert(survives(bytes), "the whole archive")
+end truncated_everywhere
+
+@test("a damaged byte of data, or a damaged CRC, is BadCrc")
+bad_crc()
+    assert_eq(first_error(patched(hand_made(), 35, u8('H'))), Some(BadCrc("a.txt")))
+    assert_eq(first_error(patched32(hand_made(), 53, 0xd8932aad)), Some(BadCrc("a.txt")))
+
+    // A bit flipped in the middle of a deflate stream is caught, by the inflater or by the CRC.
+    var w = writer()
+
+    w.add("text", repeated().view()).unwrap()
+
+    val file = w.finish()
+    val at: usize = 30 + 4 + 20
+
+    for bit in 0..<8
+        val damaged = patched(file.view(), at, file.view()[at] ^ u8(1 << bit))
+
+        first_error(damaged) match
+            Some(Corrupt(_)) | Some(BadCrc(_)) | Some(BadSize(_)) -> ()
+            other -> panic(s"bit $bit: $other")
+end bad_crc
+
+@test("sizes that disagree with the data are BadSize")
+bad_size()
+    // Stored, with an uncompressed size that is not its stored size.
+    assert_eq(first_error(patched32(hand_made(), 61, 3)), Some(BadSize("a.txt")))
+
+    // Deflated, with a recorded size one short and one long.
+    var w = writer()
+
+    w.add("text", repeated().view()).unwrap()
+
+    val file = w.finish()
+    val size_at = file.len() - 22 - 46 - 4 + 24
+
+    assert_eq(first_error(patched32(file.view(), size_at, 8799)), Some(BadSize("text")))
+    assert_eq(first_error(patched32(file.view(), size_at, 8801)), Some(BadSize("text")))
+
+    // A size deflate could never reach from this little data is refused before it is allocated.
+    assert_eq(first_error(patched32(file.view(), size_at, 0xfffffff0)), Some(BadSize("text")))
+    assert_eq(first_error(patched32(hand_made(), 61, 0xfffffff0)), Some(BadSize("a.txt")))
+end bad_size
+
+@test("a missing signature is BadSignature at the place it should have been")
+bad_signature()
+    assert_eq(first_error(patched(hand_made(), 37, 0)), Some(BadSignature(37)))
+    assert_eq(first_error(patched(hand_made(), 0, 0)), Some(BadSignature(0)))
+    assert_eq(first_error(patched(hand_made(), 3, 0x05)), Some(BadSignature(0)))
+end bad_signature
+
+@test("offsets and lengths that point outside the archive are OutOfRange")
+out_of_range()
+    // The directory said to start past the end record, or to be longer than the room before it.
+    assert_eq(first_error(patched32(hand_made(), 104, 1000)), Some(OutOfRange(88)))
+    assert_eq(first_error(patched32(hand_made(), 100, 52)), Some(OutOfRange(88)))
+    assert_eq(first_error(patched32(hand_made(), 104, 0xffffffff)), Some(OutOfRange(88)))
+
+    // The directory shorter than its one entry, and longer than it with nothing after.
+    assert_eq(first_error(patched32(patched32(hand_made(), 100, 50), 104, 37)), Some(OutOfRange(37)))
+    assert_eq(first_error(patched32(patched32(hand_made(), 100, 51), 104, 36)), Some(BadSignature(36)))
+
+    // An entry whose local header is past the start of the directory.
+    assert_eq(first_error(patched32(hand_made(), 79, 20)), Some(OutOfRange(37)))
+    assert_eq(first_error(patched32(hand_made(), 79, 0xfffffff0)), Some(OutOfRange(37)))
+
+    // A stored size running into the directory.
+    assert_eq(first_error(patched32(patched32(hand_made(), 57, 3), 61, 3)), Some(OutOfRange(0)))
+
+    // A name length running past the directory.
+    assert_eq(first_error(patched16(hand_made(), 65, 6)), Some(OutOfRange(37)))
+
+    // A local header whose name and extra run the data into the directory.
+    assert_eq(first_error(patched16(hand_made(), 28, 1)), Some(OutOfRange(0)))
+end out_of_range
+
+@test("a local header naming a different file is Mismatch")
+mismatch()
+    assert_eq(first_error(patched(hand_made(), 30, u8('b'))), Some(Mismatch("a.txt")))
+end mismatch
+
+@test("names that climb out, or are not UTF-8, are refused on open")
+zip_slip_on_read()
+    // "a.txt" rewritten in place in the central directory, five bytes at a time.
+    assert_eq(first_error(patched(hand_made(), 83, u8('/'))), Some(BadName("/.txt")))
+    assert_eq(first_error(patched(hand_made(), 84, u8('\\'))), Some(BadName("a\\txt")))
+
+    // "..txt" is a name, not a `..` component, so it is accepted -- and then found not to be the
+    // local header's "a.txt".
+    assert_eq(first_error(patched(patched(hand_made(), 83, u8('.')), 84, u8('.'))), Some(Mismatch("..txt")))
+    assert_eq(first_error(patched(patched(patched(hand_made(), 83, u8('.')), 84, u8('.')), 85, u8('/'))), Some(BadName("../xt")))
+    assert_eq(first_error(patched(hand_made(), 83, 0xff)), Some(BadName("(not UTF-8)")))
+end zip_slip_on_read
+
+@test("what this package does not read is refused by name")
+unsupported_features()
+    // Encrypted (flag bit 0), in the central directory.
+    assert_eq(first_error(patched16(hand_made(), 45, 0x0801)), Some(Encrypted("a.txt")))
+
+    // Method 99, which is AES -- listed, and refused when read.
+    val zip = open(patched16(hand_made(), 47, 99)).unwrap()
+
+    assert_eq(zip.entries[0].method, Other(99))
+    assert_eq(zip.read(zip.entries[0]).map(b -> b.len()), Err(Unsupported(99)))
+
+    // Another disk, at each of the three places the format says one.
+    assert_eq(first_error(patched16(hand_made(), 92, 1)), Some(MultiDisk))
+    assert_eq(first_error(patched16(hand_made(), 94, 1)), Some(MultiDisk))
+    assert_eq(first_error(patched16(hand_made(), 71, 1)), Some(MultiDisk))
+    assert_eq(first_error(patched16(hand_made(), 96, 0)), Some(MultiDisk))
+end unsupported_features
+
+@test("ZIP64 is recognised and refused, by its locator and by its extra field")
+zip64_refused()
+    // A ZIP64 end-of-central-directory locator sits in the 20 bytes before the end record.
+    var located: Buf[u8] = buf()
+    val h = hand_made()
+
+    located.extend(h[0..<88])
+    located.extend([0x50, 0x4b, 0x06, 0x07])
+
+    for _ in 0..<16
+        located.push(0)
+
+    located.extend(h[88..])
+
+    assert_eq(first_error(located.view()), Some(Zip64))
+
+    // An entry carrying a ZIP64 extra field (header ID 1).
+    var extra: Buf[u8] = buf()
+
+    extra.extend(h[0..<88])
+    extra.extend([1, 0, 0, 0])
+    extra.extend(h[88..])
+
+    // The name length's neighbour says four bytes of extra; the directory grows to 55, and the end
+    // record moves four bytes along with it.
+    val with_extra = patched32(patched16(extra.view(), 67, 4), 104, 55)
+
+    assert_eq(first_error(with_extra), Some(Zip64))
+
+    // The same four bytes as some other extra field are read past.
+    assert_eq(first_error(patched(with_extra, 88, 0x55)), None)
+end zip64_refused
+
+@test("a fixed-seed fuzz of mangled archives never crashes")
+fuzz_mangled()
+    val v = varied()
+    val seeds = [v.view(), fixture("infozip.zip"), fixture("utf8.zip")]
+    var r: u64 = 0x9e3779b97f4a7c15
+    var refused: usize = 0
+
+    for round in 0..<3000
+        val source = seeds[round % 3]
+        val bytes: []u8 = [0; source.len]
+
+        for i in 0..<source.len
+            bytes[i] = source[i]
+
+        r ^= r << 13
+        r ^= r >> 7
+        r ^= r << 17
+
+        for _ in 0..<1 + r % 4
+            r ^= r << 13
+            r ^= r >> 7
+            r ^= r << 17
+
+            val at = usize(r % u64(bytes.len))
+
+            bytes[at] = u8(r >> 32 & 255)
+
+        if !survives(bytes) then refused += 1
+
+    assert(refused > 0, "some of three thousand mangled archives are refused")
+end fuzz_mangled

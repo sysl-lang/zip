@@ -403,12 +403,16 @@ struct Archive
         if start + e.packed > self.directory then return Err(OutOfRange(e.offset))
         if b[name_at..<name_at + nlen] != e.name.bytes then return Err(Mismatch(e.name))
 
+        // **The sizes are checked against each other before anything is allocated**, so that a
+        // recorded size of 4 GiB over a few bytes of data costs nothing. Stored data is its own size;
+        // deflate can expand at most 1032 to 1 -- two bits for a 258-byte match.
+        if e.method == Stored && e.packed != e.size then return Err(BadSize(e.name))
+        if e.size > e.packed * 1032 then return Err(BadSize(e.name))
+
         val packed = b[start..<start + e.packed]
         var out = buf_filled(e.size, u8(0))
 
         if e.method == Stored
-            if e.packed != e.size then return Err(BadSize(e.name))
-
             copy(out.view(), packed)
         else
             var work: []u8 = [0; INFLATE_BYTES]

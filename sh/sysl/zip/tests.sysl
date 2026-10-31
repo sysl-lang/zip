@@ -7,6 +7,7 @@ module sh.sysl.zip
 // mistake. The system's `unzip` and `zipinfo` read the same archives in `tools_tests.sysl`.
 
 import sysl.buf.{Buf, buf}
+import sh.sysl.miniz.Level
 
 private struct Rng
     s: u64
@@ -152,6 +153,21 @@ large_compressible_entry()
     assert(e.packed * 4 < e.size, "text this repetitive deflates to well under a quarter")
     assert_eq(zip.read(e).unwrap().view(), big.view())
 end large_compressible_entry
+
+@test("megabytes of zeros, deflate's best ratio, are not mistaken for an impossible size")
+zeros_at_the_best_ratio()
+    val zeros: []u8 = [0; 4 << 20]
+    var w = writer(level = Level.Best)
+
+    w.add("zeros", zeros).unwrap()
+
+    val file = w.finish()
+    val zip = open(file.view()).unwrap()
+    val e = zip.entries[0]
+
+    assert(e.packed * 1000 < e.size, "close to deflate's limit of 1032 to 1")
+    assert_eq(zip.read(e).unwrap().view(), zeros)
+end zeros_at_the_best_ratio
 
 @test("data deflate cannot shrink is stored instead")
 incompressible_is_stored()
