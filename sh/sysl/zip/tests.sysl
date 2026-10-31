@@ -371,6 +371,28 @@ entry_count_limit()
     assert_eq(zip.entries[65534].name, "65534")
 end entry_count_limit
 
+// The README's example, with `?` carrying errors out as it does there.
+private readme_example(model: string) -> Result[usize, ZipError]
+    var w = writer()
+
+    w.add("[Content_Types].xml", "<Types/>".bytes)?
+    w.add("3D/3dmodel.model", model.bytes)?
+
+    val file = w.finish()
+    val zip = open(file.view())?
+    var total: usize = 0
+
+    for e in zip.entries.view()
+        total += zip.read(e)?.len()
+
+    Ok(total)
+end readme_example
+
+@test("the README's example runs")
+the_readme_example()
+    assert_eq(readme_example("<model/>"), Ok(16))
+end the_readme_example
+
 @test("every error says what went wrong")
 errors_display()
     assert_eq(NotZip.to_string(), "not a ZIP archive: no end-of-central-directory record")
