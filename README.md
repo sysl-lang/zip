@@ -27,7 +27,7 @@ for e in zip.entries.view()
 
 ```hocon
 dependencies {
-  zip { git = "github.com/sysl-lang/zip", version = "0.1.0" }
+  zip { git = "github.com/sysl-lang/zip", version = "0.1.1" }
 }
 ```
 

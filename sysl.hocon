@@ -9,14 +9,14 @@
 // This is the block a consumer writes to reach it:
 //
 //     dependencies {
-//       zip { git = "github.com/sysl-lang/zip", version = "0.1.0" }
+//       zip { git = "github.com/sysl-lang/zip", version = "0.1.1" }
 //     }
 //
 // The coordinate names the package, `zip`; the module a program imports is `sh.sysl.zip`.
 
 package {
   name    = "zip"
-  version = "0.1.0"
+  version = "0.1.1"
 
   // **The oldest compiler this builds with**, raised to the one it was last built and tested with.
   sysl = "0.8.9"
@@ -34,5 +34,5 @@ requires {
 
 // Raw DEFLATE, inflate and CRC-32, with caller-owned state.
 dependencies {
-  miniz { git = "github.com/sysl-lang/miniz", version = "0.3.2" }
+  miniz { git = "github.com/sysl-lang/miniz", version = "0.3.3" }
 }
