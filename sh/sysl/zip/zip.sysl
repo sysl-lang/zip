@@ -413,11 +413,11 @@ struct Archive
         var out = buf_filled(e.size, u8(0))
 
         if e.method == Stored
-            copy(out.view(), packed)
+            copy(out.view_mut(), packed)
         else
             var work: []u8 = [0; INFLATE_BYTES]
 
-            inflate(work, packed, out.view(), Format.Raw) match
+            inflate(work, packed, out.view_mut(), Format.Raw) match
                 Ok(n) -> if n != e.size then return Err(BadSize(e.name))
                 Err(Full) -> return Err(BadSize(e.name))
                 Err(Trailing) -> return Err(BadSize(e.name))
